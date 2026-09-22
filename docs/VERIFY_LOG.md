@@ -17,3 +17,4 @@
 | 13 | WS `l2Book` for HIP-3 (20 levels) | **CONFIRMED** | Works on mainnet WS; real depth flowing. |
 | 14 | Yahoo Finance reference (v8 chart) | **CONFIRMED** | `query1.finance.yahoo.com/v8/finance/chart/{SYM}` returns `regularMarketPrice` + `regularMarketTime` + `marketState`, no API key. Used for US equity live reference. |
 | 15 | `prevDayPx` as last_close | **CONFIRMED** | Every `allDexsAssetCtxs` ctx includes `prevDayPx` → used as `last_close` reference (guarantees ≥1 reference per market). |
+| 16 | Privy embedded wallet signs HL EIP-712 (approveBuilderFee/approveAgent/order) | **OPEN** | `@nktkas/hyperliquid` has first-class Privy support (`toViemAccount` → `AbstractWallet`, explicit `signTypedData` options for Privy). Code wired in `apps/web/lib/hl.ts`. **Needs a live test** with a real Privy app + funded wallet to confirm the embedded-wallet signature is accepted by HL (chainId 133 domain). |

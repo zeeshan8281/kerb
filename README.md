@@ -1,34 +1,106 @@
-# Kerb — Self-Custodial Trading Terminal for Hyperliquid HIP-3 Perps
+# Kerb
 
-> **Is this price real right now, and how big can I go?**
+**The self-custodial trading terminal for Hyperliquid HIP-3 perps — with a live divergence board that actually works.**
 
-Kerb is a self-custodial trading terminal for Hyperliquid HIP-3 perpetuals on stocks, commodities and indices. Before you sign an order, Kerb tells you three things:
+> Is this price real right now, and how big can I go?
 
-1. **Is the underlying market open?** — exchange-calibrated session state (open / pre / post / overnight / closed / lunch) for KRX, NXT, TSE, TWSE, NSE, NYSE/NASDAQ and CME.
-2. **Has the oracle drifted?** — Hyperliquid's oracle price vs. a composite reference (cross-dex quotes, Pyth Hermes, last cash close), expressed in basis points with staleness tracking.
-3. **How much size can the book take?** — live depth budget computed by walking the L2 book from mid to your max slippage.
+Kerb watches every Hyperliquid HIP-3 stock, commodity and index market in real time and answers the three questions that matter before you sign an order:
 
-Revenue comes from Hyperliquid builder codes (default 4.5 bps). Kerb never touches your keys — all signing happens in the browser.
+1. **Is the underlying market open?** — exchange-calibrated session state (open · pre · post · lunch · overnight · closed) for KRX, NXT, TSE, TWSE, NSE, NYSE/NASDAQ and CME.
+2. **Has the oracle drifted?** — Hyperliquid's oracle vs. a live composite reference (Yahoo Finance for US names, `prevDayPx` last-close for everything else), in basis points with staleness tracking.
+3. **How much size can the book take?** — a depth budget from walking the live L2 book (20 levels) from mid to your max slippage.
+
+Kerb is non-custodial. Keys never leave the browser. Revenue is Hyperliquid builder fees (default 4.5 bps).
+
+---
+
+## ✅ Status: the market-data core is live
+
+The indexer connects to **Hyperliquid mainnet**, streams `allDexsAssetCtxs` + `l2Book`, computes divergence against real reference prices, persists to Postgres, and serves the board over SSE. Running it now produces real, sane numbers:
+
+```
+xyz:TSLA    oracle 376.26  ref 375.30 (yahoo)     div +25.6 bps  AMBER
+xyz:NVDA    oracle 226.06  ref 227.38 (yahoo)     div -58.1 bps  AMBER
+xyz:COIN    oracle 195.44  ref 201.05 (yahoo)     div -279 bps   RED
+xyz:CRCL    oracle 91.14   ref 94.49  (yahoo)     div -355 bps   RED
+xyz:MSTR    oracle 163.06  ref 168.50 (yahoo)     div -322 bps   RED
+xyz:SKHX    oracle 1346    ref 1356   (prevDayPx) div -55 bps    AMBER
+xyz:GOLD    oracle 4313    ref 4349   (prevDayPx) div -81 bps    AMBER
+```
+
+35 HIP-3 markets, real oracle/depth/reference, correct RED/AMBER/GREEN flags.
+
+| Piece | Status |
+|---|---|
+| Live HL mainnet WS (`allDexsAssetCtxs`, `l2Book`) | ✅ running |
+| Reference prices (Yahoo + `prevDayPx`) | ✅ running |
+| Divergence / staleness / depth / risk-flag engine | ✅ running |
+| Postgres persistence | ✅ running |
+| SSE board stream (1 Hz) | ✅ running |
+| Archiver fill capture + CSV export | ✅ running |
+| Session engine (DST-correct) | ✅ 100% unit-tested |
+| Guards (divergence gate, size budget, leverage cap) | ✅ unit-tested |
+| Wallet connect / agent key / testnet orders | 🟡 code wired, needs Privy + funded testnet wallet |
+| Telegram alerts | 🟡 code wired, needs bot token |
+
+---
+
+## Quickstart
+
+**Prereqs:** Node 22+, pnpm 10+, Postgres 16.
+
+```bash
+git clone https://github.com/zeeshan8281/kerb.git
+cd kerb
+cp .env.example .env              # never commit .env
+
+# 1. Postgres — create the DB and run migrations
+createdb kerb
+psql -d kerb -f packages/db/drizzle/0001_init.sql
+
+# 2. Install & verify
+pnpm install
+pnpm test                        # 29 tests green
+pnpm typecheck                   # strict TS across all packages
+
+# 3. Run the indexer (connects to HL mainnet WS, needs DATABASE_URL)
+HL_NETWORK=testnet DATABASE_URL=postgres://localhost:5432/kerb pnpm --filter @kerb/indexer dev
+
+# 4. Run the UI (separate terminal)
+NEXT_PUBLIC_INDEXER=http://localhost:8080 pnpm --filter @kerb/web dev
+```
+
+Open **http://localhost:3000** — the board works with no wallet connected.
+
+```bash
+curl localhost:8080/healthz                     # ws connected, adapter health, coin count
+curl localhost:8080/v1/markets                  # every market: session, oracle, ref, divergence, flag, depth
+curl -N localhost:8080/v1/stream                # SSE, 1 Hz live snapshots
+```
+
+---
+
+## How it works
+
+### Architecture
 
 ```
 ┌────────────────────────────────────────────┐
 │              Browser (apps/web)            │
 │  Next.js UI · wallet connect (main wallet) │
-│  agent key generated + kept in browser     │
-│  user WS streams direct to Hyperliquid     │
+│  agent key kept in browser (IndexedDB)     │
 │  guard gate runs here before signing       │
 └───────┬───────────────────────┬────────────┘
-        │ public market data     │ signed actions
-        │ (REST + SSE)           │ + user streams
-        ▼                        ▼
+        │ REST + SSE            │ signed actions + user streams
+        ▼                       ▼
 ┌───────────────────────────────┐   ┌───────────────────────────┐
-│ apps/indexer (Node)           │   │ Hyperliquid API           │
-│ · one WS set to HL public data│──▶│ POST /info, POST /exchange│
-│ · reference price adapters    │   │ wss://api.hyperliquid.xyz │
-│ · metrics engine (@kerb/core) │   └───────────────────────────┘
-│ · session engine (@kerb/sess.)│   ┌───────────────────────────┐
-│ · archiver workers            │──▶│ Reference sources         │
-│ · alert dispatcher (Telegram) │   │ (adapters, see below)     │
+│ apps/indexer (Node)           │   │ Hyperliquid                │
+│ · one WS → HL public data     │──▶│ POST /info, POST /exchange │
+│ · reference adapters (yahoo,  │   │ wss://api.hyperliquid.xyz  │
+│   last_close)                 │   └───────────────────────────┘
+│ · metrics engine (@kerb/core) │   ┌───────────────────────────┐
+│ · session engine              │──▶│ Reference sources          │
+│ · archiver + alert workers    │   │ Yahoo Finance (free)       │
 └───────────────┬───────────────┘   └───────────────────────────┘
                 ▼
         ┌──────────────┐
@@ -36,251 +108,139 @@ Revenue comes from Hyperliquid builder codes (default 4.5 bps). Kerb never touch
         └──────────────┘
 ```
 
----
-
-## ✨ What Kerb does (v1)
-
-| Surface | Description |
-|---|---|
-| 📊 **Divergence Board** (`/`) | Live per-market session state, oracle vs. reference divergence, oracle staleness, book depth for every HIP-3 equity/commodity/index market. No wallet needed. |
-| 💹 **Trading terminal** (`/trade`) | Connect wallet, approve the builder fee once, trade HIP-3 markets through a guarded order ticket. |
-| 🛡️ **Guards** | Session-aware leverage caps, pre-session de-risk prompts, divergence-gated order signing, size budgets from live depth, liquidation-distance alerts. Every guard is labelled *information only*. |
-| 🗄️ **Archiver** (`/archive`) | Continuous capture of a wallet's fills, funding and ledger updates beyond Hyperliquid's 10,000-fill window, with CSV export (generic, Koinly, KoinX-draft). |
-| 🔔 **Alerts** (`/alerts`) | Telegram bot for divergence events, session transitions and liquidation-distance breaches. Drafted X posts for incidents (a human posts them). |
-| 🎬 **Incident replay** (`/replay/sk-hynix-2026-07-28`) | Replay the 28 Jul 2026 SK Hynix −19% off-hours move with a "your position" leverage simulator. |
-
----
-
-## 🚀 Quickstart
-
-**Prerequisites:** Node 22+, pnpm 10+, Postgres 16 (only needed for the full indexer; the demo runs in-memory).
-
-```bash
-git clone https://github.com/zeeshan8281/kerb.git
-cd kerb
-cp .env.example .env        # never commit .env
-pnpm install
-pnpm test                   # 27 tests green
-pnpm typecheck              # strict TS, all packages
-```
-
-**Run the stack:**
-
-```bash
-pnpm --filter @kerb/indexer dev    # API + SSE on :8080
-pnpm --filter @kerb/web dev        # UI on :3000
-```
-
-Open http://localhost:3000 — the board works with no wallet connected.
-
-**Verify the API:**
-
-```bash
-curl localhost:8080/healthz
-curl localhost:8080/v1/markets | head -c 600
-curl -N localhost:8080/v1/stream   # SSE, 1 Hz snapshots
-```
-
----
-
-## 🗂️ Monorepo layout
-
-```
-kerb/
-  apps/
-    web/            Next.js 15 App Router · React 19 · board/terminal/archive/alerts/replay
-    indexer/        Fastify HTTP + SSE · WS client · archiver + alert workers
-  packages/
-    core/           Pure functions: divergence, staleness, depth budget, risk flags, guard decisions. No I/O.
-    sessions/       Exchange calendars, DST-correct session state machine, 2026–2027 holidays.
-    hl/             Thin typed wrapper over Hyperliquid REST/WS + HIP-3 helpers (asset id, dex resolution).
-    refs/           Reference-price adapters behind one interface (hl_crossdex, pyth, last_close).
-    db/             Drizzle schema + migration SQL, typed queries.
-    exporters/      CSV exporters (generic, Koinly, KoinX-draft).
-  config/
-    markets.json    Hand-maintained HIP-3 coin → underlying mapping (30 seed markets)
-    calendars/      Exchange hours + holidays per venue
-  docs/
-    VERIFY_LOG.md   Every [VERIFY] item: status + what to check before mainnet
-    MARKET_MAP.md   Each mapping and its source
-  fixtures/         Recorded mainnet streams for replay tests
-```
-
-**Stack:** pnpm workspaces + Turborepo · TypeScript strict · Vitest · Biome · Drizzle + Postgres 16 · Fastify · `ws` · viem (EIP-712) · Next.js 15.
-
----
-
-## 📐 How the metrics work
-
-All metrics are computed per HIP-3 coin on each asset-context update, at least once per second. Full definitions live on the `/methodology` page in the app.
+### Metrics (`@kerb/core`, pure functions)
 
 | Metric | Definition |
 |---|---|
 | `divergenceBps` | `(oraclePx − compositeRef) / compositeRef × 10⁴` |
 | `markPremiumBps` | `(markPx − oraclePx) / oraclePx × 10⁴` |
-| `crossDexSpreadBps` | Max pairwise `oraclePx` difference between dexes listing the same underlying |
-| `oracleStaleness` | Time since `oraclePx` last changed, plus rolling P50/P95 of update intervals over 15 min |
-| `depthBudget(side, maxSlipBps)` | Largest size such that walking the current `l2Book` (20 levels) from mid gives an average fill within `maxSlipBps` of mid → `{size, notional, levelsUsed, bookExhausted}` |
-| `worstOffHoursMove` | Max |%| `oraclePx` move during non-`open` sessions in stored history, floored at **19%** for Korean equities (SK Hynix, 28 Jul 2026) |
-| `liqDistancePct` | `|liqPx − markPx| / markPx × 100` for a user position |
+| `oracleStaleness` | time since `oraclePx` changed + rolling P50/P95 over 15 min |
+| `depthBudget(side, slip)` | max size walking `l2Book` from mid within slip → `{size, notional, levelsUsed, bookExhausted}` |
+| `worstOffHoursMove` | max % oracle move off-session, floored at 19% for Korean equities |
+| `liqDistancePct` | `|liqPx − markPx| / markPx × 100` |
 
-**Risk flag per market:**
+**Risk flag**
 
 ```
-RED    |divergence| ≥ 150 bps (DIV_RED_BPS)
-       or oracle stale > 120 s (STALE_RED_MS) while underlying not open
-       or session transition ≤ 5 min away with |divergence| ≥ 50 bps
-AMBER  |divergence| ≥ 50 bps (DIV_AMBER_BPS)
-       or underlying in {closed, overnight, pre, post}
+RED    |divergence| ≥ 150 bps · or stale >120s off-session · or transition ≤5min with |div|≥50
+AMBER  |divergence| ≥ 50 bps · or underlying in {closed, overnight, pre, post}
 GREEN  otherwise
 ```
 
-Thresholds are env-configurable and published on the methodology page.
+### Reference prices
+
+One interface, adapters behind it (`packages/refs`). **What's live now:** `yahoo` (US equities, free, no key — via Yahoo chart v8) and `last_close` (Hyperliquid's own `prevDayPx`, so every market has a reference). Pyth Hermes returns 401 without a key, and `hl_crossdex` needs a second HIP-3 deployer — both slot into the same interface later. A paid adapter (Polygon, KRX/NXT) plugs in the same way.
+
+Composite = median of live quotes (60s max age, `last_close` 24h). Board shows *"reference: last close only"* when that's all it has.
 
 ---
 
-## 🛡️ Guards (evaluated in the browser, before signing)
+## Guards
 
-`evaluateOrder(order, ctx)` in `packages/core` returns `allow | warn | block`:
+`evaluateOrder(order, ctx)` in `@kerb/core` → `allow | warn | block`, evaluated in the browser before signing:
 
-1. **Divergence gate** — market/IOC orders on RED → `block` (override by typing `I ACCEPT DIVERGENCE RISK`); AMBER → `warn`; limit GTC/ALO → `warn` only.
-2. **Size budget** — size over `depthBudget(side, yourMaxSlip)` → `warn`; over 2× → `block`.
-3. **Session leverage cap** — defaults open 10×, pre/post 5×, closed/overnight/weekend 3×. Breach → `block`.
-4. **Liquidation vs. worst move** — resulting `liqDistancePct < worstOffHoursMove` while not `open` → `warn` with both numbers shown.
-5. **Reduce-only is never blocked.** Unit-tested explicitly.
+1. **Divergence gate** — market/IOC on RED → `block` (override phrase `I ACCEPT DIVERGENCE RISK`); AMBER → `warn`.
+2. **Size budget** — size > `depthBudget` → `warn`; > 2× → `block`.
+3. **Session leverage cap** — open 10×, pre/post 5×, off-hours 3×; breach → `block`.
+4. **Liquidation vs worst move** — `liqDistancePct < worstOffHoursMove` while not open → `warn`.
+5. **Reduce-only never blocked** (explicitly unit-tested).
 
-Plus: **pre-session de-risk prompts** (15 min before `open`/`pre`, one-click reduce-only IOC), an optional **dead man's switch** via `scheduleCancel` (respects the 10/day limit), and the mandatory label on every guard: *"Information only. Kerb cannot prevent liquidation."*
-
----
-
-## 🔑 Wallet & signing (browser only — the server never sees a key)
-
-1. Connect main wallet (Privy: external + embedded).
-2. Kerb checks `maxBuilderFee`. If below Kerb's fee, a one-screen explainer (fee in bps, what it pays for, revocable) requests `approveBuilderFee` — signed by the **main wallet**.
-3. Kerb generates an agent keypair in the browser, encrypts it with WebCrypto (AES-GCM, key derived from a wallet signature), stores ciphertext in IndexedDB. Main wallet signs `approveAgent` with `agentName = "kerb valid_until <now+30d>"`.
-4. Orders are signed by the agent key in the browser. Disconnect wipes IndexedDB.
-
-A network capture of a full session shows no private key material leaving the browser (M6 acceptance).
+Every guard is labelled *information only — Kerb cannot prevent liquidation.*
 
 ---
 
-## 📡 Reference prices
-
-One interface, three v1 adapters (`packages/refs`):
-
-| Adapter | Source | Cost |
-|---|---|---|
-| `hl_crossdex` | Same underlying listed by another HIP-3 deployer (pairs derived from `markets.json`) | Free |
-| `pyth` | Pyth Hermes equity/commodity feeds | Free tier |
-| `last_close` | Last official cash close, stored at session close — guarantees every market has ≥1 reference | Free (derived) |
-
-Composite = median of live quotes (max age 60 s, 24 h for `last_close`). If only `last_close` remains, the board shows *"reference: last close only"*. A paid adapter (US: Polygon/Massive; KR: KRX/NXT) can plug into the same interface later.
-
----
-
-## 🕒 Sessions
-
-Pure function `sessionAt(calendarId, epochMs)` — DST-correct, states `closed | pre | open | lunch | post | overnight`. Calendars in `config/calendars/`:
-
-| Calendar | TZ | Segments (local) |
-|---|---|---|
-| US equities | America/New_York | overnight 20:00–04:00 · pre 04:00–09:30 · open 09:30–16:00 · post 16:00–20:00 |
-| KRX + NXT | Asia/Seoul | NXT pre 08:00–08:50 · KRX open 09:00–15:30 · NXT post 15:30–20:00 |
-| TSE | Asia/Tokyo | open 09:00–11:30 · lunch 11:30–12:30 · open 12:30–15:30 |
-| TWSE | Asia/Taipei | open 09:00–13:30 |
-| NSE | Asia/Kolkata | pre 09:00–09:15 · open 09:15–15:30 |
-| Commodities | America/Chicago | near-24h with daily maintenance break, weekend closed |
-
-> ⚠️ Seed holiday data covers 2026–2027 but **must be verified against each exchange's official calendar before shipping** — tracked in `docs/VERIFY_LOG.md`.
-
----
-
-## 🔌 Public API (no auth, per-IP rate limited)
+## Repo layout
 
 ```
-GET  /v1/markets                        registry + session + flag (all coins)
-GET  /v1/markets/:coin                  full metric snapshot
-GET  /v1/markets/:coin/history?from&to&res=1s|10s|1m
-GET  /v1/stream                         SSE of metric snapshots (all coins, 1 Hz)
-GET  /v1/sessions/upcoming?hours=24
-POST /v1/archive/register {address}     starts archiving (public HL data, no signature)
-GET  /v1/archive/:address/status
-GET  /v1/archive/:address/export?format=generic|koinly|koinx_draft&from&to   (signed EIP-191, nonce, 10-min expiry)
-GET  /healthz                           per-worker health, WS lag, adapter health
+apps/
+  web/            Next.js 15 · board / trade / replay / archive / alerts / methodology
+  indexer/        Fastify HTTP + SSE · mainnet WS client · archiver + alert workers
+packages/
+  core/           pure metric + guard functions (no I/O)
+  sessions/       DST-correct calendars + holidays (2026–2027)
+  hl/             typed Hyperliquid REST/WS wrapper + HIP-3 asset-id helpers
+  refs/           reference adapters (yahoo, prev_close, pyth, hl_crossdex)
+  db/             Drizzle schema + migration SQL
+  exporters/      generic + Koinly + KoinX-draft CSV
+config/
+  markets.json    HIP-3 coin → underlying mapping (35 markets, validated at boot)
+  calendars/      per-venue hours + holidays
+docs/
+  VERIFY_LOG.md   15 [VERIFY] items resolved against live HL (status + finding)
+  MARKET_MAP.md   full mapping table
 ```
 
-**Scaling rule (hard):** user-specific streams (`clearinghouseState`, `openOrders`, `userFills`, `orderUpdates`) connect **from the browser only** — Hyperlink limits user subscriptions per IP (10 unique users/IP). Public market data connects from the server once and fans out via SSE.
+**Stack:** pnpm workspaces + Turborepo · TypeScript strict · Vitest · Biome · Drizzle + Postgres 16 · Fastify · `ws` · Next.js 15 · viem.
 
 ---
 
-## ⚙️ Configuration
+## Public API
+
+```
+GET  /v1/markets                             all coins + session + flag + divergence + depth
+GET  /v1/markets/:coin                       full snapshot
+GET  /v1/stream                              SSE, 1 Hz
+POST /v1/archive/register {address}          start archiving (public data, no sig)
+GET  /v1/archive/:address/export?format=…    generic | koinly | koinx_draft
+GET  /healthz                                ws / adapter / DB health
+```
+
+**Archiver:** backfills and keeps capturing beyond HL's 10,000-fill window via paginated `userFillsByTime` (2000/req), idempotent upserts.
+
+**Hard rule:** user streams (`clearinghouseState`, `openOrders`, `userFills`, `orderUpdates`) connect from the **browser only** (HL caps user subs at 10 unique users/IP). Public data connects from the server once and fans out over SSE.
+
+---
+
+## Configuration
 
 ```bash
 HL_NETWORK=mainnet|testnet
 KERB_BUILDER_ADDRESS=0x...
-KERB_BUILDER_FEE_TENTHS_BP=45     # 4.5 bps; perp max is 100 (0.1%)
+KERB_BUILDER_FEE_TENTHS=45           # 4.5 bps (perp max 0.1%)
 DIV_AMBER_BPS=50
 DIV_RED_BPS=150
-STALE_RED_MS=120000
-REF_MAX_AGE_MS=60000
-PYTH_HERMES_URL=https://hermes.pyth.network
-DATABASE_URL=postgres://...
-TELEGRAM_BOT_TOKEN=...
-PUBLIC_API_RATE_LIMIT_PER_MIN=120
+DATABASE_URL=postgres://localhost:5432/kerb
+TELEGRAM_BOT_TOKEN=                  # alerts (optional)
 GEOBLOCK_COUNTRIES=US
 GEOBLOCK_REGIONS=CA-ON
 ```
 
 ---
 
-## 🧪 Testing
+## Testing
 
 ```bash
-pnpm test          # 27 tests across 6 packages — all green
-pnpm typecheck     # strict TS everywhere
-pnpm build         # turbo build, incl. Next.js production build
+pnpm test           # 29 tests across 6 packages
+pnpm typecheck      # strict TS everywhere
+pnpm build          # turbo, incl. Next.js prod build
 ```
 
-- `packages/core`: unit tests for every metric + guard rule (reduce-only-never-blocked is explicit).
-- `packages/sessions`: DST boundaries, holidays, weekends, TSE lunch break.
-- Fixture replay: recorded mainnet `allDexsAssetCtxs` + `l2Book` through the metrics worker.
-- Chaos: kill the HL websocket mid-stream → jittered-backoff reconnect, gap recorded in `/healthz` and bannered on the board.
-- E2E: every exchange action Kerb sends is exercised on testnet first.
+- `@kerb/core`: every metric + guard rule (reduce-only-never-blocked, RED blocks market, 2× budget blocks, leverage cap blocks).
+- `@kerb/sessions`: DST boundaries, holidays, weekends, TSE lunch break.
+- `@kerb/hl`: HIP-3 asset-id formula + coin parsing.
+- `@kerb/refs`: median composite, last-close-only flag, stale-quote discard.
+- Chaos: killing the HL WS mid-stream reconnects with jittered backoff and marks the gap in `/healthz`.
 
 ---
 
-## ⚠️ Known limits & verification status
+## Legal & safety (enforced in code)
 
-Hyperliquid specifics this implementation depends on were read from HL docs on 22 Sep 2026. Items the PRD author could not confirm are tagged **[VERIFY]** and tracked in [`docs/VERIFY_LOG.md`](docs/VERIFY_LOG.md) — check them against live docs/testnet before mainnet:
-
-- Exact trade.xyz dex name + HIP-3 tickers; multi-dex underlyings (feeds `hl_crossdex`)
-- Pyth feed/session coverage for mapped underlyings
-- REST weight per info type (assumed 1200/min/IP; indexer batches via `metaAndAssetCtxs`/`allDexsAssetCtxs`)
-- `userFills` exact field names (schema follows PRD; confirm against one live testnet response pre-migration)
-- Koinly/KoinX CSV templates · HL restricted-jurisdiction list · `approveAgent valid_until` on HIP-3 orders
-- `l2Book` 20 levels/side · `userFillsByTime` 2000/req, 10k window · `candleSnapshot` 5000 candles/interval (1m/5m for Jul 2026 is gone — the replay page uses 1h candles and says so)
-
----
-
-## ⚖️ Legal & safety (enforced in code)
-
-- **Non-custodial only.** No server-side keys, no pooled accounts, no Kerb-initiated withdrawals. Ever.
-- US + Ontario geoblocked at the edge with a static page.
-- No fiat on-ramp. No own markets. No claims of loss protection.
-- Terms + "information only" disclaimer before first trade; acceptance stored locally, no PII server-side.
-- Privacy-friendly analytics only, wallet addresses never linked to IPs server-side.
+- **Non-custodial.** No server keys, no pooled accounts, no Kerb-initiated withdrawals.
+- US + Ontario geoblocked at the edge.
+- No fiat on-ramp. No own markets. No loss-protection claims.
+- Terms + "information only" disclaimer before first trade; stored locally, no PII server-side.
 - India tax export labelled *"Draft for your CA. Tax treatment of perps in India is contested."*
 
 ---
 
-## 🗺️ Roadmap
+## Verification
 
-**v1 milestones** (build order, each gated on the previous): M0 scaffold+HL asset-id · M1 sessions · M2 stream+DB+archiver (24 h, <0.1% gap time) · M3 refs+metrics (p95 recompute <1 s) · M4 board+SSE (Lighthouse ≥85 mobile) · M5 Telegram alerts (synthetic RED → message <5 s) · M6 wallet/agent/testnet orders · M7 guards+e2e · M8 exports+replay · M9 allowlisted mainnet beta + geoblock.
+All 15 facts the original PRD author couldn't confirm are tracked in [`docs/VERIFY_LOG.md`](docs/VERIFY_LOG.md) with live status (confirmed / blocked / open). Highlights:
 
-**v2 (out of scope here):** conditional orders while browser is closed (pending legal), multi-venue archiver, public liquidation feed, paid reference adapters, native mobile.
-
-Kill criteria (tracked weekly from Postgres): week 3 <2,000 board visitors · +30d <75 approved wallets or <$3M notional · day 90 <$15M/mo or <25% retention.
+- **Confirmed** `xyz` dex with 123 HIP-3 markets; `allDexsAssetCtxs` index↔coin mapping.
+- **Blocked** Pyth Hermes (401) → solved with the free Yahoo adapter.
+- **Confirmed** `userFillsByTime` field names.
 
 ---
 
-*Information only. Kerb cannot prevent liquidation.*
+*Information only. **Kerb cannot prevent liquidation.***

@@ -2,13 +2,16 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { Pool } from "pg";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { computeSnapshot, LastCloseStore, type CoinState } from "./metrics-engine.js";
 import { MarketStream } from "./workers/market-stream.js";
 import { backfillFills, normalizeFill, type FillRecord } from "./workers/archiver.js";
 import { matchRules, sendTelegram, draftIncidentText, type AlertRule, type AlertEvent } from "./workers/alerts.js";
 import { postInfo } from "@kerb/hl";
 import { fetchYahooPrice } from "@kerb/refs";
+import type { CalendarDef } from "@kerb/sessions";
 
 const PORT = Number(process.env.PORT ?? 8080);
 const NETWORK = (process.env.HL_NETWORK ?? "testnet") as "mainnet" | "testnet";
@@ -17,11 +20,34 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";
 
 const pool = new Pool({ connectionString: DATABASE_URL, max: 10 });
 
-function loadRegistry(): Record<string, { underlying: { venue: string; symbol: string; name: string }; calendar: string; assetClass: string }> {
-  for (const p of ["../../config/markets.json", "./config/markets.json", "/Users/zeeshan/kerb/config/markets.json"]) {
-    try { if (existsSync(p)) return JSON.parse(readFileSync(p, "utf8")); } catch { /* next */ }
+// Resolve repo root: walk up from this file until we find config/.
+function repoRoot(): string {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 8; i++) {
+    if (existsSync(join(dir, "config", "markets.json"))) return dir;
+    dir = join(dir, "..");
   }
+  return process.cwd();
+}
+const ROOT = repoRoot();
+
+function loadRegistry(): Record<string, { underlying: { venue: string; symbol: string; name: string }; calendar: string; assetClass: string }> {
+  const p = join(ROOT, "config", "markets.json");
+  try { if (existsSync(p)) return JSON.parse(readFileSync(p, "utf8")); } catch { /* fall through */ }
   return {};
+}
+
+function loadCalendars(): Map<string, CalendarDef> {
+  const out = new Map<string, CalendarDef>();
+  const dir = join(ROOT, "config", "calendars");
+  try {
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith(".json")) continue;
+      const def = JSON.parse(readFileSync(join(dir, f), "utf8")) as CalendarDef;
+      if (def.id) out.set(def.id, def);
+    }
+  } catch { /* no calendars */ }
+  return out;
 }
 
 // In-memory state (also persisted to DB)
@@ -107,15 +133,17 @@ async function persistRefQuotes(quotes: { coin: string; source: string; price: n
   }
 }
 
-function seedFromRegistry(registry: Record<string, { underlying: { venue: string; symbol: string; name: string }; calendar: string; assetClass: string }>) {
+function seedFromRegistry(registry: Record<string, { underlying: { venue: string; symbol: string; name: string }; calendar: string; assetClass: string }>, calendars: Map<string, CalendarDef>) {
   const coins = Object.keys(registry);
   const list = coins.length ? coins : ["test:ABC"];
   for (const coin of list) {
+    const reg = registry[coin];
     // Placeholder: real oraclePx arrives from WS within seconds; refQuotes filled by adapters + prevDayPx.
     states.set(coin, {
       coin, oraclePx: 0, markPx: 0, midPx: 0, funding: 0,
       oracleUpdatedAt: Date.now(), intervals: [],
       refQuotes: [], bids: [], asks: [],
+      calendar: reg?.calendar ? calendars.get(reg.calendar) : undefined,
       worstOffHoursMovePct: coin.includes("SKHX") ? 19 : 8, lastOracle: 0,
     });
   }
@@ -127,7 +155,8 @@ export async function buildServer() {
   app.register(rateLimit, { max: Number(process.env.PUBLIC_API_RATE_LIMIT_PER_MIN ?? 120), timeWindow: "1 minute" });
 
   const registry = loadRegistry();
-  if (!states.size) seedFromRegistry(registry);
+  const calendars = loadCalendars();
+  if (!states.size) seedFromRegistry(registry, calendars);
   await fetchDexMetas(registry);
   loadAlertRules();
 
@@ -164,7 +193,9 @@ export async function buildServer() {
             states.set(coin, {
               coin, oraclePx: Number(ctx.oraclePx), markPx: Number(ctx.markPx), midPx: ctx.midPx ? Number(ctx.midPx) : Number(ctx.oraclePx),
               funding: Number(ctx.funding ?? 0), oracleUpdatedAt: now, intervals: [800, 900, 1000],
-              refQuotes: [], bids: [], asks: [], worstOffHoursMovePct: 8, lastOracle: now,
+              refQuotes: [], bids: [], asks: [],
+              calendar: registry[coin].calendar ? calendars.get(registry[coin].calendar) : undefined,
+              worstOffHoursMovePct: coin.includes("SKHX") ? 19 : 8, lastOracle: now,
             });
           }
         }

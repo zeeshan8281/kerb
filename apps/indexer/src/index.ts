@@ -20,6 +20,18 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";
 
 const pool = new Pool({ connectionString: DATABASE_URL, max: 10 });
 
+async function migrate() {
+  const sqlPath = join(ROOT, "packages", "db", "drizzle", "0001_init.sql");
+  try {
+    if (existsSync(sqlPath)) {
+      await pool.query(readFileSync(sqlPath, "utf8"));
+      console.log("[migrate] schema applied");
+    }
+  } catch (e) {
+    console.error("[migrate] failed:", (e as Error).message);
+  }
+}
+
 // Resolve repo root: walk up from this file until we find config/.
 function repoRoot(): string {
   let dir = dirname(fileURLToPath(import.meta.url));
@@ -156,6 +168,7 @@ export async function buildServer() {
 
   const registry = loadRegistry();
   const calendars = loadCalendars();
+  await migrate();
   if (!states.size) seedFromRegistry(registry, calendars);
   await fetchDexMetas(registry);
   loadAlertRules();

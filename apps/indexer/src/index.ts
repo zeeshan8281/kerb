@@ -8,6 +8,7 @@ import { MarketStream } from "./workers/market-stream.js";
 import { backfillFills, normalizeFill, type FillRecord } from "./workers/archiver.js";
 import { matchRules, sendTelegram, draftIncidentText, type AlertRule, type AlertEvent } from "./workers/alerts.js";
 import { postInfo } from "@kerb/hl";
+import { fetchYahooPrice } from "@kerb/refs";
 
 const PORT = Number(process.env.PORT ?? 8080);
 const NETWORK = (process.env.HL_NETWORK ?? "testnet") as "mainnet" | "testnet";
@@ -109,21 +110,14 @@ async function persistRefQuotes(quotes: { coin: string; source: string; price: n
 function seedFromRegistry(registry: Record<string, { underlying: { venue: string; symbol: string; name: string }; calendar: string; assetClass: string }>) {
   const coins = Object.keys(registry);
   const list = coins.length ? coins : ["test:ABC"];
-  let i = 0;
   for (const coin of list) {
-    const base = 100 + i * 37;
+    // Placeholder: real oraclePx arrives from WS within seconds; refQuotes filled by adapters + prevDayPx.
     states.set(coin, {
-      coin, oraclePx: base, markPx: base * 1.0004, midPx: base, funding: 0.0001,
-      oracleUpdatedAt: Date.now(), intervals: [800, 900, 1000],
-      refQuotes: [
-        { source: "last_close", coin, price: base * 0.995, ts: Date.now(), session: "closed" },
-        { source: "pyth", coin, price: base * 1.001, ts: Date.now(), session: "open" },
-      ],
-      bids: [{ px: base - 0.1, sz: 5 }, { px: base - 0.3, sz: 10 }],
-      asks: [{ px: base + 0.1, sz: 5 }, { px: base + 0.3, sz: 10 }],
-      worstOffHoursMovePct: coin.includes("SKHX") ? 19 : 8, lastOracle: base,
+      coin, oraclePx: 0, markPx: 0, midPx: 0, funding: 0,
+      oracleUpdatedAt: Date.now(), intervals: [],
+      refQuotes: [], bids: [], asks: [],
+      worstOffHoursMovePct: coin.includes("SKHX") ? 19 : 8, lastOracle: 0,
     });
-    i++;
   }
 }
 
@@ -159,6 +153,12 @@ export async function buildServer() {
             if (s.intervals.length > 900) s.intervals.shift();
             s.oracleUpdatedAt = now;
             if (prevOracle !== s.oraclePx) s.lastOracle = now;
+            // last_close reference = prevDayPx (previous day's close, real, always available)
+            if (ctx.prevDayPx) {
+              const lastClose = s.refQuotes.find((q) => q.source === "last_close");
+              if (lastClose) { lastClose.price = Number(ctx.prevDayPx); lastClose.ts = now; }
+              else s.refQuotes.push({ source: "last_close", coin, price: Number(ctx.prevDayPx), ts: now, session: "closed" });
+            }
           } else if (registry[coin]) {
             // New mapped coin discovered
             states.set(coin, {
@@ -189,6 +189,27 @@ export async function buildServer() {
   };
   setInterval(resubscribeBooks, 30000);
   resubscribeBooks();
+
+  // Reference-price worker: Yahoo Finance for US equities (venue NASDAQ/NYSE/CBOE).
+  // Non-US underlyings fall back to last_close (prevDayPx). pyth/crossdex adapters slot in here.
+  const US_VENUES = new Set(["NASDAQ", "NYSE", "CBOE", "AMEX"]);
+  async function pollYahooRefs() {
+    for (const [coin, reg] of Object.entries(registry)) {
+      const venue = reg.underlying?.venue?.toUpperCase();
+      if (!US_VENUES.has(venue)) continue;
+      const symbol = reg.underlying?.symbol;
+      if (!symbol) continue;
+      const p = await fetchYahooPrice(symbol);
+      if (!p || !p.price) continue;
+      const s = states.get(coin);
+      if (!s) continue;
+      const q = s.refQuotes.find((x) => x.source === "yahoo");
+      if (q) { q.price = p.price; q.ts = p.ts; q.session = p.session; }
+      else s.refQuotes.push({ source: "yahoo", coin, price: p.price, ts: p.ts, session: p.session });
+    }
+  }
+  void pollYahooRefs();
+  setInterval(() => void pollYahooRefs(), 15_000);
 
   // Metrics compute + persist loop (1 Hz)
   setInterval(async () => {

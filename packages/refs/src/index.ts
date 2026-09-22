@@ -1,5 +1,5 @@
 import type { SessionState } from "@kerb/sessions";
-export type RefSourceId = "hl_crossdex" | "pyth" | "last_close";
+export type RefSourceId = "hl_crossdex" | "pyth" | "yahoo" | "last_close";
 export interface RefQuote { source: RefSourceId; coin: string; price: number; ts: number; session: SessionState; confidence?: number }
 export interface RefAdapter {
   id: RefSourceId;
@@ -59,4 +59,45 @@ export async function fetchPythPrice(priceId: string, hermesUrl = "https://herme
     if (!p) return null;
     return { price: Number(p.price) * 10 ** p.expo, conf: Number(p.conf) * 10 ** p.expo, ts: p.publish_time * 1000 };
   } catch { return null; }
+}
+
+/** Yahoo Finance chart endpoint: free live/last-close reference for US equities. */
+export async function fetchYahooPrice(symbol: string): Promise<{ price: number; ts: number; session: SessionState } | null> {
+  try {
+    const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1d&interval=1m`, {
+      headers: { "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)" },
+    });
+    if (!r.ok) return null;
+    const j = await r.json() as { chart?: { result?: [{ meta?: { regularMarketPrice?: number; regularMarketTime?: number; marketState?: string } }] } };
+    const meta = j.chart?.result?.[0]?.meta;
+    if (!meta || meta.regularMarketPrice == null) return null;
+    const session: SessionState = meta.marketState === "REGULAR" ? "open" : meta.marketState === "PRE" ? "pre" : meta.marketState === "POST" ? "post" : "closed";
+    // Use observation time so the quote stays "fresh" for compositeRef; session conveys open/closed.
+    return { price: meta.regularMarketPrice, ts: Date.now(), session };
+  } catch { return null; }
+}
+
+/** Yahoo adapter: poll US equity symbols (venue NYSE/NASDAQ/CBOE etc), emit quotes. */
+export function yahooAdapter(symbolFor: (coin: string) => string | null, pollMs = 15_000): RefAdapter {
+  let lastQuoteAt = 0;
+  return {
+    id: "yahoo",
+    supports: (coin) => symbolFor(coin) != null,
+    subscribe(coins, onQuote) {
+      let stopped = false;
+      const tick = async () => {
+        if (stopped) return;
+        for (const coin of coins) {
+          const sym = symbolFor(coin);
+          if (!sym) continue;
+          const p = await fetchYahooPrice(sym);
+          if (p) { lastQuoteAt = Date.now(); onQuote({ source: "yahoo", coin, price: p.price, ts: p.ts, session: p.session }); }
+        }
+      };
+      void tick();
+      const t = setInterval(() => void tick(), pollMs);
+      return () => { stopped = true; clearInterval(t as unknown as number); };
+    },
+    health: () => ({ ok: true, lastQuoteAt: lastQuoteAt || undefined }),
+  };
 }

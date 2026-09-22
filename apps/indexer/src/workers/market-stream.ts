@@ -5,6 +5,7 @@ export interface StreamHealth { connected: boolean; lastMsgAt: number; gaps: { f
 export class MarketStream {
   private ws?: WebSocket; health: StreamHealth = { connected: false, lastMsgAt: 0, gaps: [], reconnects: 0 };
   private timer?: NodeJS.Timeout; private backoff = 1000;
+  private pendingBooks = new Set<string>();
   constructor(private network: "mainnet" | "testnet", private onMsg: (msg: unknown) => void) {}
   start() { this.connect(); this.timer = setInterval(() => this.watchdog(), 5000); }
   stop() { clearInterval(this.timer); this.ws?.close(); }
@@ -13,6 +14,10 @@ export class MarketStream {
     this.ws.on("open", () => {
       this.health.connected = true; this.backoff = 1000;
       this.ws!.send(JSON.stringify({ method: "subscribe", subscription: { type: "allDexsAssetCtxs" } }));
+      // Flush pending book subscriptions
+      for (const coin of this.pendingBooks) {
+        this.ws!.send(JSON.stringify({ method: "subscribe", subscription: { type: "l2Book", coin } }));
+      }
     });
     this.ws.on("message", (d) => {
       const now = Date.now();
@@ -27,7 +32,12 @@ export class MarketStream {
       setTimeout(() => this.connect(), wait);
     });
   }
-  subscribeBook(coin: string) { this.ws?.send(JSON.stringify({ method: "subscribe", subscription: { type: "l2Book", coin } })); }
+  subscribeBook(coin: string) {
+    this.pendingBooks.add(coin);
+    if (this.health.connected && this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ method: "subscribe", subscription: { type: "l2Book", coin } }));
+    }
+  }
   private watchdog() {
     if (Date.now() - this.health.lastMsgAt > 10_000 && this.health.connected) {
       // gap detection: surfaced via /healthz + board banner

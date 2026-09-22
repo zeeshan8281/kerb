@@ -5,7 +5,7 @@ WORKDIR /app
 FROM base AS build
 COPY . .
 RUN pnpm install --frozen-lockfile
-RUN pnpm --filter @kerb/web build
+RUN pnpm build
 
 FROM base AS runtime
 WORKDIR /app
